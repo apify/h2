@@ -1913,6 +1913,8 @@ async fn receive_settings_frame_twice_with_second_one_non_empty() {
     join(srv, h2).await;
 }
 
+// If the server has not sent a go_away message before dropping the connection
+// make sure the UnexpectedEof error is propogated.
 #[tokio::test]
 async fn server_drop_connection_unexpectedly_return_unexpected_eof_err() {
     h2_support::trace_init!();
@@ -1951,6 +1953,110 @@ async fn server_drop_connection_unexpectedly_return_unexpected_eof_err() {
         );
     };
     join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn server_drop_connection_after_go_away() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::go_away(1)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        srv.close_without_notify();
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::handshake(io).await.unwrap();
+        tokio::spawn(async move {
+            let request = Request::builder()
+                .uri("https://http2.akamai.com/")
+                .body(())
+                .unwrap();
+            let _res = client
+                .send_request(request, true)
+                .unwrap()
+                .0
+                .await
+                .expect("request");
+        });
+        let _ = h2.await.unwrap();
+    };
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn reset_before_headers_reaches_peer_without_headers() {
+    // Repro: body future errors immediately and hyper/h2 converts that into a
+    // RST_STREAM before the queued HEADERS are ever written, so the peer sees
+    // a reset for an idle stream and treats it as a PROTOCOL_ERROR.
+    h2_support::trace_init!();
+
+    let (io, srv) = mock::new();
+
+    // Server task: perform handshake then observe the first frame.
+    let srv = async move {
+        let mut srv = srv;
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+
+        let frame = tokio::time::timeout(Duration::from_secs(1), srv.next())
+            .await
+            .expect("timed out waiting for first frame")
+            .expect("unexpected EOF")
+            .expect("frame error");
+
+        match frame {
+            frame::Frame::Headers(h) if h.stream_id() == StreamId::from(1) => {
+                assert!(h.is_end_stream() == false);
+            }
+            frame::Frame::Reset(rst) if rst.stream_id() == StreamId::from(1) => {
+                panic!(
+                    "BUG: client sent RST_STREAM before any HEADERS on stream 1; reason={:?}",
+                    rst.reason()
+                );
+            }
+            other => panic!("unexpected first frame: {:?}", other),
+        }
+    };
+
+    // Client task: queue HEADERS, immediately reset, then drive the connection.
+    let client = async move {
+        let (client, conn) = client::handshake(io).await.unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+        let mut client = client.ready().await.expect("poll_ready");
+        let (_resp_fut, mut send_stream) = client.send_request(req, false).unwrap();
+
+        // Simulate body error (reqwest wraps into io::Error::Other) by resetting
+        // immediately after the stream is created.
+        send_stream.send_reset(Reason::INTERNAL_ERROR);
+
+        // Now start driving the connection so the queued frames get written.
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        // Give the connection a moment to flush frames.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        drop(send_stream);
+        let _ = conn_task.await;
+    };
+
+    join(srv, client).await;
 }
 
 const SETTINGS: &[u8] = &[0, 0, 0, 4, 0, 0, 0, 0, 0];
