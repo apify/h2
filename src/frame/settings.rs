@@ -38,7 +38,8 @@ const ACK: u8 = 0x1;
 const ALL: u8 = ACK;
 
 /// The default value of SETTINGS_HEADER_TABLE_SIZE
-pub const DEFAULT_SETTINGS_HEADER_TABLE_SIZE: usize = 4_096;
+/// [impit patch] Changed from 4096 to 65536 to match real browsers (Chrome, Firefox, Edge all use 65536).
+pub const DEFAULT_SETTINGS_HEADER_TABLE_SIZE: usize = 65_536;
 
 /// The default value of SETTINGS_INITIAL_WINDOW_SIZE
 pub const DEFAULT_INITIAL_WINDOW_SIZE: u32 = 65_535;
@@ -385,5 +386,17 @@ impl fmt::Debug for SettingsFlags {
         util::debug_flags(f, self.0)
             .flag_if(self.is_ack(), "ACK")
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_default_header_table_size_is_browser_value() {
+        // [impit patch] Must be 65536 to match real browsers (Chrome, Firefox, Edge).
+        // The upstream default of 4096 is a fingerprinting giveaway.
+        assert_eq!(DEFAULT_SETTINGS_HEADER_TABLE_SIZE, 65_536);
     }
 }

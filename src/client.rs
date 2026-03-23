@@ -343,6 +343,11 @@ pub struct Builder {
     ///
     /// When this gets exceeded, we issue GOAWAYs.
     local_max_error_reset_streams: Option<usize>,
+
+    /// [impit patch] Per-connection pseudo-header order for HEADERS frames.
+    /// E.g. Chrome uses `:method, :authority, :scheme, :path`,
+    /// while Firefox uses `:method, :path, :authority, :scheme`.
+    pseudo_header_order: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -653,7 +658,15 @@ impl Builder {
     /// # pub fn main() {}
     /// ```
     pub fn new() -> Builder {
-        Builder {
+        // [impit patch] Read pseudo-header order from env var at connection creation time.
+        // This value is stored per-connection in the Codec, so once the connection is
+        // established, the env var can change without affecting this connection.
+        // This is a significant improvement over reading the env var on every HEADERS frame.
+        let pseudo_header_order = std::env::var("IMPIT_H2_PSEUDOHEADERS_ORDER").ok().map(|val| {
+            val.split(',').map(|s| s.to_string()).collect::<Vec<String>>()
+        });
+
+        let mut builder = Builder {
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
@@ -663,7 +676,27 @@ impl Builder {
             settings: Default::default(),
             stream_id: 1.into(),
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
+            pseudo_header_order,
+        };
+
+        // [impit patch] Set HEADER_TABLE_SIZE=65536 as the default.
+        // Real browsers (Chrome, Firefox, Edge) all send HEADER_TABLE_SIZE=65536
+        // in their SETTINGS frame. The h2 crate default of 4096 is a dead giveaway
+        // that the client is not a real browser. This is safe to set as a global
+        // default because ALL browsers use the same value.
+        builder.header_table_size(65536);
+
+        // [impit patch] Read MAX_CONCURRENT_STREAMS from env var.
+        // Chrome sends MAX_CONCURRENT_STREAMS=1000, Firefox doesn't send it.
+        // reqwest doesn't expose this setting, so we read it via env var
+        // (same approach as pseudo-header order -- read once per connection).
+        if let Ok(val) = std::env::var("IMPIT_H2_MAX_CONCURRENT_STREAMS") {
+            if let Ok(v) = val.parse::<u32>() {
+                builder.max_concurrent_streams(v);
+            }
         }
+
+        builder
     }
 
     /// Indicates the initial window size (in octets) for stream-level
@@ -1145,6 +1178,19 @@ impl Builder {
         self
     }
 
+    /// [impit patch] Sets the pseudo-header order for HEADERS frames.
+    ///
+    /// Different browsers use different pseudo-header orders:
+    /// - Chrome/Edge: `:method, :authority, :scheme, :path`
+    /// - Firefox: `:method, :path, :authority, :scheme`
+    ///
+    /// The order is stored per-connection, making it safe for multiple
+    /// concurrent connections with different browser fingerprints.
+    pub fn pseudo_header_order(&mut self, order: Vec<String>) -> &mut Self {
+        self.pseudo_header_order = Some(order);
+        self
+    }
+
     /// Sets the first stream ID to something other than 1.
     #[cfg(feature = "unstable")]
     pub fn initial_stream_id(&mut self, stream_id: u32) -> &mut Self {
@@ -1317,6 +1363,11 @@ where
 
         if let Some(max) = builder.settings.max_header_list_size() {
             codec.set_max_recv_header_list_size(max as usize);
+        }
+
+        // [impit patch] Set per-connection pseudo-header order
+        if let Some(order) = builder.pseudo_header_order.clone() {
+            codec.set_pseudo_header_order(order);
         }
 
         // Send initial settings frame

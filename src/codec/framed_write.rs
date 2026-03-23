@@ -52,6 +52,11 @@ struct Encoder<B> {
 
     /// Min buffer required to attempt to write a frame
     min_buffer_capacity: usize,
+
+    /// [impit patch] Per-connection pseudo-header order for HEADERS frames.
+    /// This replaces the process-global env var approach to allow multiple
+    /// concurrent h2 connections with different browser fingerprints.
+    pseudo_header_order: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -99,6 +104,7 @@ where
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
                 chain_threshold,
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
+                pseudo_header_order: None,
             },
         }
     }
@@ -252,13 +258,13 @@ where
             }
             Frame::Headers(v) => {
                 let mut buf = limited_write_buf!(self);
-                if let Some(continuation) = v.encode(&mut self.hpack, &mut buf) {
+                if let Some(continuation) = v.encode(&mut self.hpack, self.pseudo_header_order.as_deref(), &mut buf) {
                     self.next = Some(Next::Continuation(continuation));
                 }
             }
             Frame::PushPromise(v) => {
                 let mut buf = limited_write_buf!(self);
-                if let Some(continuation) = v.encode(&mut self.hpack, &mut buf) {
+                if let Some(continuation) = v.encode(&mut self.hpack, self.pseudo_header_order.as_deref(), &mut buf) {
                     self.next = Some(Next::Continuation(continuation));
                 }
             }
@@ -335,6 +341,11 @@ impl<T, B> FramedWrite<T, B> {
     /// Retrieve the last data frame that has been sent
     pub fn take_last_data_frame(&mut self) -> Option<frame::Data<B>> {
         self.encoder.last_data_frame.take()
+    }
+
+    /// [impit patch] Set the pseudo-header order for HEADERS frames on this connection.
+    pub fn set_pseudo_header_order(&mut self, order: Vec<String>) {
+        self.encoder.pseudo_header_order = Some(order);
     }
 
     pub fn get_mut(&mut self) -> &mut T {
