@@ -258,13 +258,21 @@ where
             }
             Frame::Headers(v) => {
                 let mut buf = limited_write_buf!(self);
-                if let Some(continuation) = v.encode(&mut self.hpack, self.pseudo_header_order.as_deref(), &mut buf) {
+                if let Some(continuation) = v.encode(
+                    &mut self.hpack,
+                    self.pseudo_header_order.as_deref(),
+                    &mut buf,
+                ) {
                     self.next = Some(Next::Continuation(continuation));
                 }
             }
             Frame::PushPromise(v) => {
                 let mut buf = limited_write_buf!(self);
-                if let Some(continuation) = v.encode(&mut self.hpack, self.pseudo_header_order.as_deref(), &mut buf) {
+                if let Some(continuation) = v.encode(
+                    &mut self.hpack,
+                    self.pseudo_header_order.as_deref(),
+                    &mut buf,
+                ) {
                     self.next = Some(Next::Continuation(continuation));
                 }
             }

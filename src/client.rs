@@ -662,9 +662,13 @@ impl Builder {
         // This value is stored per-connection in the Codec, so once the connection is
         // established, the env var can change without affecting this connection.
         // This is a significant improvement over reading the env var on every HEADERS frame.
-        let pseudo_header_order = std::env::var("IMPIT_H2_PSEUDOHEADERS_ORDER").ok().map(|val| {
-            val.split(',').map(|s| s.to_string()).collect::<Vec<String>>()
-        });
+        let pseudo_header_order = std::env::var("IMPIT_H2_PSEUDOHEADERS_ORDER")
+            .ok()
+            .map(|val| {
+                val.split(',')
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>()
+            });
 
         let mut builder = Builder {
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,

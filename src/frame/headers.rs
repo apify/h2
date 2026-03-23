@@ -97,12 +97,8 @@ static VALID_PSEUDOHEADERS: [&str; 6] = [
 ];
 
 /// Default pseudo-header order for requests (only the 4 request pseudo-headers).
-static DEFAULT_REQUEST_PSEUDOHEADER_ORDER: [&str; 4] = [
-    ":method",
-    ":scheme",
-    ":authority",
-    ":path",
-];
+static DEFAULT_REQUEST_PSEUDOHEADER_ORDER: [&str; 4] =
+    [":method", ":scheme", ":authority", ":path"];
 
 #[derive(Debug)]
 struct PseudoheadersOrder {
@@ -1014,13 +1010,19 @@ impl HeaderBlock {
         Ok(())
     }
 
-    fn into_encoding(self, encoder: &mut hpack::Encoder, pseudo_header_order: Option<&[String]>) -> EncodingHeaderBlock {
+    fn into_encoding(
+        self,
+        encoder: &mut hpack::Encoder,
+        pseudo_header_order: Option<&[String]>,
+    ) -> EncodingHeaderBlock {
         let mut hpack = BytesMut::new();
 
         // [impit patch] Use per-connection pseudo-header order if provided,
         // otherwise fall back to env var (for backward compatibility) or default.
         let order = match pseudo_header_order {
-            Some(order) => PseudoheadersOrder { inner: order.to_vec() },
+            Some(order) => PseudoheadersOrder {
+                inner: order.to_vec(),
+            },
             None => PseudoheadersOrder::load(),
         };
 
@@ -1105,7 +1107,11 @@ mod test {
         );
 
         let continuation = headers
-            .encode(&mut encoder, None, &mut (&mut dst).limit(frame::HEADER_LEN + 8))
+            .encode(
+                &mut encoder,
+                None,
+                &mut (&mut dst).limit(frame::HEADER_LEN + 8),
+            )
             .unwrap();
 
         assert_eq!(17, dst.len());
@@ -1401,7 +1407,10 @@ mod test {
             .expect("decode failed");
 
         // Pseudo-headers should appear in the custom order
-        assert!(decoded_headers.len() >= 4, "expected at least 4 pseudo-headers");
+        assert!(
+            decoded_headers.len() >= 4,
+            "expected at least 4 pseudo-headers"
+        );
 
         // Verify order: path, method, scheme, authority
         assert!(
