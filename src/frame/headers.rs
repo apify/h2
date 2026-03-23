@@ -86,7 +86,8 @@ pub struct Iter {
     pseudo_order: PseudoheadersOrder,
 }
 
-static PSEUDOHEADERS: [&str; 6] = [
+/// All valid HTTP/2 pseudo-headers (for validation).
+static VALID_PSEUDOHEADERS: [&str; 6] = [
     ":method",
     ":scheme",
     ":authority",
@@ -95,33 +96,40 @@ static PSEUDOHEADERS: [&str; 6] = [
     ":status",
 ];
 
+/// Default pseudo-header order for requests (only the 4 request pseudo-headers).
+static DEFAULT_REQUEST_PSEUDOHEADER_ORDER: [&str; 4] =
+    [":method", ":scheme", ":authority", ":path"];
+
 #[derive(Debug)]
 struct PseudoheadersOrder {
     pub inner: Vec<String>,
 }
 
 impl PseudoheadersOrder {
+    /// Load pseudo-header order from IMPIT_H2_PSEUDOHEADERS_ORDER env var.
+    /// If not set, uses the default request pseudo-header order.
+    /// [impit patch] The env var only needs to contain the pseudo-headers relevant
+    /// to the request (typically: :method, :authority/:path, :scheme, :path/:authority).
+    /// Response pseudo-headers (:status) and Extended CONNECT (:protocol) are optional.
     pub fn load() -> Self {
-        let pseudo_env_var_order =
-            std::env::var("IMPIT_H2_PSEUDOHEADERS_ORDER").unwrap_or(PSEUDOHEADERS.join(","));
+        let order_str = std::env::var("IMPIT_H2_PSEUDOHEADERS_ORDER")
+            .unwrap_or_else(|_| DEFAULT_REQUEST_PSEUDOHEADER_ORDER.join(","));
 
-        PseudoheadersOrder::from(pseudo_env_var_order)
+        PseudoheadersOrder::from(order_str)
     }
 }
 
 impl From<String> for PseudoheadersOrder {
     fn from(order: String) -> Self {
-        let parsed: Vec<String> = order.split(",").map(|s| s.to_string()).collect();
+        let parsed: Vec<String> = order.split(',').map(|s| s.to_string()).collect();
 
+        // [impit patch] Only validate that provided headers are valid pseudo-headers.
+        // Don't require ALL pseudo-headers to be present -- a request only needs
+        // :method, :scheme, :authority, :path. :status is response-only and
+        // :protocol is for Extended CONNECT only.
         for header in parsed.iter() {
-            if !PSEUDOHEADERS.contains(&header.as_str()) {
+            if !VALID_PSEUDOHEADERS.contains(&header.as_str()) {
                 panic!("[impit patch] Invalid pseudoheader: {}", header);
-            }
-        }
-
-        for header in PSEUDOHEADERS.iter() {
-            if !parsed.contains(&header.to_string()) {
-                panic!("[impit patch] Missing pseudoheader: {}", header);
             }
         }
 
@@ -320,6 +328,7 @@ impl Headers {
     pub fn encode(
         self,
         encoder: &mut hpack::Encoder,
+        pseudo_header_order: Option<&[String]>,
         dst: &mut EncodeBuf<'_>,
     ) -> Option<Continuation> {
         // At this point, the `is_end_headers` flag should always be set
@@ -329,7 +338,7 @@ impl Headers {
         let head = self.head();
 
         self.header_block
-            .into_encoding(encoder)
+            .into_encoding(encoder, pseudo_header_order)
             .encode(&head, dst, |_| {})
     }
 
@@ -541,6 +550,7 @@ impl PushPromise {
     pub fn encode(
         self,
         encoder: &mut hpack::Encoder,
+        pseudo_header_order: Option<&[String]>,
         dst: &mut EncodeBuf<'_>,
     ) -> Option<Continuation> {
         // At this point, the `is_end_headers` flag should always be set
@@ -550,7 +560,7 @@ impl PushPromise {
         let promised_id = self.promised_id;
 
         self.header_block
-            .into_encoding(encoder)
+            .into_encoding(encoder, pseudo_header_order)
             .encode(&head, dst, |dst| {
                 dst.put_u32(promised_id.into());
             })
@@ -1000,13 +1010,26 @@ impl HeaderBlock {
         Ok(())
     }
 
-    fn into_encoding(self, encoder: &mut hpack::Encoder) -> EncodingHeaderBlock {
+    fn into_encoding(
+        self,
+        encoder: &mut hpack::Encoder,
+        pseudo_header_order: Option<&[String]>,
+    ) -> EncodingHeaderBlock {
         let mut hpack = BytesMut::new();
+
+        // [impit patch] Use per-connection pseudo-header order if provided,
+        // otherwise fall back to env var (for backward compatibility) or default.
+        let order = match pseudo_header_order {
+            Some(order) => PseudoheadersOrder {
+                inner: order.to_vec(),
+            },
+            None => PseudoheadersOrder::load(),
+        };
 
         let headers = Iter {
             pseudo: Some(self.pseudo),
             fields: self.fields.into_iter(),
-            pseudo_order: PseudoheadersOrder::load(),
+            pseudo_order: order,
         };
 
         encoder.encode(headers, &mut hpack);
@@ -1057,7 +1080,7 @@ fn decoded_header_size(name: usize, value: usize) -> usize {
 mod test {
     use super::*;
     use crate::frame;
-    use crate::hpack::{huffman, Encoder};
+    use crate::hpack::{huffman, Decoder, Encoder};
 
     #[test]
     fn test_nameless_header_at_resume() {
@@ -1084,7 +1107,11 @@ mod test {
         );
 
         let continuation = headers
-            .encode(&mut encoder, &mut (&mut dst).limit(frame::HEADER_LEN + 8))
+            .encode(
+                &mut encoder,
+                None,
+                &mut (&mut dst).limit(frame::HEADER_LEN + 8),
+            )
             .unwrap();
 
         assert_eq!(17, dst.len());
@@ -1274,5 +1301,153 @@ mod test {
                 }
             );
         }
+    }
+
+    // ===== impit patch tests =====
+
+    #[test]
+    fn test_pseudoheaders_order_from_valid_string() {
+        let order = PseudoheadersOrder::from(":method,:scheme,:authority,:path".to_string());
+        assert_eq!(
+            order.inner,
+            vec![":method", ":scheme", ":authority", ":path"]
+        );
+
+        let order = PseudoheadersOrder::from(":path,:method,:scheme,:authority".to_string());
+        assert_eq!(
+            order.inner,
+            vec![":path", ":method", ":scheme", ":authority"]
+        );
+
+        // Subset is valid (e.g. response only needs :status)
+        let order = PseudoheadersOrder::from(":status".to_string());
+        assert_eq!(order.inner, vec![":status"]);
+
+        // All 6 valid pseudo-headers
+        let order = PseudoheadersOrder::from(
+            ":method,:scheme,:authority,:path,:protocol,:status".to_string(),
+        );
+        assert_eq!(order.inner.len(), 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid pseudoheader")]
+    fn test_pseudoheaders_order_from_invalid_panics() {
+        let _ = PseudoheadersOrder::from(":method,:bogus".to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid pseudoheader")]
+    fn test_pseudoheaders_order_from_non_pseudo_panics() {
+        let _ = PseudoheadersOrder::from("content-type".to_string());
+    }
+
+    #[test]
+    fn test_pseudoheaders_order_load_env_var() {
+        // Test default (env var unset)
+        std::env::remove_var("IMPIT_H2_PSEUDOHEADERS_ORDER");
+        let order = PseudoheadersOrder::load();
+        assert_eq!(
+            order.inner,
+            vec![":method", ":scheme", ":authority", ":path"]
+        );
+
+        // Test with env var set
+        std::env::set_var(
+            "IMPIT_H2_PSEUDOHEADERS_ORDER",
+            ":path,:method,:scheme,:authority",
+        );
+        let order = PseudoheadersOrder::load();
+        assert_eq!(
+            order.inner,
+            vec![":path", ":method", ":scheme", ":authority"]
+        );
+
+        // Clean up
+        std::env::remove_var("IMPIT_H2_PSEUDOHEADERS_ORDER");
+    }
+
+    #[test]
+    fn test_encoding_respects_custom_pseudo_header_order() {
+        let mut encoder = Encoder::default();
+
+        let pseudo = Pseudo {
+            method: Method::GET.into(),
+            scheme: BytesStr::from_static("https").into(),
+            authority: BytesStr::from_static("example.com").into(),
+            path: BytesStr::from_static("/test").into(),
+            ..Default::default()
+        };
+
+        let block = HeaderBlock {
+            fields: HeaderMap::new(),
+            field_size: 0,
+            is_over_size: false,
+            pseudo,
+        };
+
+        // Custom order: path, method, scheme, authority (different from default)
+        let custom_order: Vec<String> = vec![
+            ":path".into(),
+            ":method".into(),
+            ":scheme".into(),
+            ":authority".into(),
+        ];
+
+        let encoding = block.into_encoding(&mut encoder, Some(&custom_order));
+
+        // Decode and verify order
+        let mut decoder = Decoder::new(0);
+        let mut decoded_headers = Vec::new();
+        let mut hpack_bytes = BytesMut::from(encoding.hpack.as_ref());
+        decoder
+            .decode(&mut std::io::Cursor::new(&mut hpack_bytes), |h| {
+                decoded_headers.push(h);
+            })
+            .expect("decode failed");
+
+        // Pseudo-headers should appear in the custom order
+        assert!(
+            decoded_headers.len() >= 4,
+            "expected at least 4 pseudo-headers"
+        );
+
+        // Verify order: path, method, scheme, authority
+        assert!(
+            matches!(&decoded_headers[0], hpack::Header::Path(p) if p.as_ref() == b"/test"),
+            "first header should be :path, got {:?}",
+            decoded_headers[0]
+        );
+        assert!(
+            matches!(&decoded_headers[1], hpack::Header::Method(m) if *m == Method::GET),
+            "second header should be :method, got {:?}",
+            decoded_headers[1]
+        );
+        assert!(
+            matches!(&decoded_headers[2], hpack::Header::Scheme(s) if s.as_ref() == b"https"),
+            "third header should be :scheme, got {:?}",
+            decoded_headers[2]
+        );
+        assert!(
+            matches!(&decoded_headers[3], hpack::Header::Authority(a) if a.as_ref() == b"example.com"),
+            "fourth header should be :authority, got {:?}",
+            decoded_headers[3]
+        );
+    }
+
+    #[test]
+    fn test_default_pseudoheader_constants() {
+        assert_eq!(VALID_PSEUDOHEADERS.len(), 6);
+        assert!(VALID_PSEUDOHEADERS.contains(&":method"));
+        assert!(VALID_PSEUDOHEADERS.contains(&":scheme"));
+        assert!(VALID_PSEUDOHEADERS.contains(&":authority"));
+        assert!(VALID_PSEUDOHEADERS.contains(&":path"));
+        assert!(VALID_PSEUDOHEADERS.contains(&":protocol"));
+        assert!(VALID_PSEUDOHEADERS.contains(&":status"));
+
+        assert_eq!(
+            DEFAULT_REQUEST_PSEUDOHEADER_ORDER,
+            [":method", ":scheme", ":authority", ":path"]
+        );
     }
 }

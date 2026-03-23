@@ -105,6 +105,11 @@ impl<T, B> Codec<T, B> {
         self.inner.set_max_header_list_size(val);
     }
 
+    /// [impit patch] Set the pseudo-header order for HEADERS frames on this connection.
+    pub fn set_pseudo_header_order(&mut self, order: Vec<String>) {
+        self.framed_write().set_pseudo_header_order(order);
+    }
+
     /// Get a reference to the inner stream.
     #[cfg(feature = "unstable")]
     pub fn get_ref(&self) -> &T {
